@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# Archives
+*.zip
+*.rar
+*.7z
+
+# Dataset
+dataset/
+data/raw/
+
+# Training outputs
+runs/
+checkpoints/
+**/checkpoints/
+
+# Large research code (only if you don't want it)
+code/Faster_RCNN/checkpoints/

@@ -1,0 +1,12 @@
+train:
+  - D:/CoconutPalmDetection/coconut_dataset/train/images
+  - D:/CoconutPalmDetection/palm_dataset/train/images
+
+val: D:/CoconutPalmDetection/coconut_dataset/valid/images
+
+test:
+  - D:/CoconutPalmDetection/coconut_dataset/test/images
+  - D:/CoconutPalmDetection/palm_dataset/test/images
+
+nc: 2
+names: ['coconut-tree', 'palm-tree']
