@@ -133,6 +133,9 @@ class ModelRegistry:
 
     # =========================================================
     # LOAD MODEL
+    #
+    # Returns a "bundle" dict: model, device, backend, name, path.
+    # core.inference.infer() and the benchmark workers expect it.
     # =========================================================
 
     def load(
@@ -157,10 +160,16 @@ class ModelRegistry:
 
         if path.suffix.lower() == ".pth":
 
-            return load_fasterrcnn(
-                str(path),
-                runtime_device
-            )
+            return {
+                "model": load_fasterrcnn(
+                    str(path),
+                    runtime_device
+                ),
+                "device": runtime_device,
+                "backend": "torchvision",
+                "name": model_name,
+                "path": str(path),
+            }
 
         # =====================================================
         # YOLO
@@ -176,7 +185,13 @@ class ModelRegistry:
                 runtime_device
             )
 
-            return model
+            return {
+                "model": model,
+                "device": runtime_device,
+                "backend": "ultralytics",
+                "name": model_name,
+                "path": str(path),
+            }
 
         # =====================================================
         # UNSUPPORTED

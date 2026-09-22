@@ -1,592 +1,539 @@
+import os
 import threading
 import time
 
 import cv2
-import torch
-from torchvision.transforms.functional import to_tensor
+
+from .benchmark import BenchmarkRecorder
+from .inference import as_bundle, infer
+
+
+# Warm-up ends after `warmup_seconds` AND at least this many inferences
+MIN_WARMUP_INFERENCES = 3
+
+# How long the inference loop waits for a new frame before re-checking Stop
+FRAME_WAIT_S = 0.5
 
 
 class LiveBenchmarkWorker:
+    """
+    Benchmarks the MODEL on a live stream (RTSP / RTMP / file / camera index).
+
+    Design
+    ------
+    * A reader thread keeps only the newest frame. Capture, decoding and
+      network jitter therefore never enter the model timings, and the model
+      always works on a fresh frame instead of a stale buffered one.
+    * The worker thread times only `infer()` (preprocess + forward +
+      postprocess, GPU-synchronised). Drawing is left to the UI.
+    * Phases: connecting -> warmup -> benchmarking -> finished.
+    * stop() ends the run at any phase and still produces a results dict
+      (partial if stopped early).
+    * `benchmark_seconds=None` means: run until stop() is called.
+    """
 
     def __init__(
         self,
         model,
         source,
-        confidence=0.50,
-        iou=0.50,
+        device=None,
         imgsz=640,
+        confidence=0.5,
+        iou=0.5,
         warmup_seconds=10,
-        device="cpu"
+        benchmark_seconds=60,
+        task="",
+        rtsp_tcp=True,
+        read_timeout=5.0,
+        config=None,
+        system=None,
     ):
 
-        self.model = model
-        self.source = source
+        self.bundle = as_bundle(model, device)
+        self.device = self.bundle["device"]
 
+        self.source = source
+        self.task = task
+        self.imgsz = imgsz
         self.confidence = confidence
         self.iou = iou
-        self.imgsz = imgsz
+
         self.warmup_seconds = warmup_seconds
-        self.device = device
+        self.benchmark_seconds = benchmark_seconds
 
-        # =====================================================
-        # THREAD CONTROL
-        # =====================================================
+        self.rtsp_tcp = rtsp_tcp
+        self.read_timeout = read_timeout
 
-        self.stop_event = threading.Event()
+        # Snapshot of the settings used for THIS run (shown in the report)
+        self.config = dict(config or {})
+        self.system = dict(system or {})
+
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._frame_cv = threading.Condition()
 
         self.thread = None
 
-        self.lock = threading.Lock()
-
-        # =====================================================
-        # CURRENT FRAME
-        # =====================================================
-
-        self.frame = None
-
-        # =====================================================
-        # METRICS
-        # =====================================================
-
-        self.latency_ms = 0.0
-
-        self.inference_fps = 0.0
-
-        self.processing_fps = 0.0
-
-        self.detections = 0
-
-        # =====================================================
-        # BENCHMARK
-        # =====================================================
-
-        self.benchmark_start_time = None
-
-        self.frames_processed = 0
-
-        # =====================================================
-        # STATUS
-        # =====================================================
-
-        self.running = False
-
-        self.finished = False
-
-        self.error = None
+        self._reset()
 
     # =========================================================
-    # START
+    # STATE
+    # =========================================================
+
+    def _reset(self):
+
+        self.recorder = BenchmarkRecorder()
+
+        self._running = False
+        self.finished = False
+        self.error = None
+        self.phase = "idle"
+        self.results = None
+
+        # newest-frame buffer (written by the reader thread)
+        self._latest = None
+        self._frame_id = 0
+        self._captured = 0
+        self._stream_lost = False
+
+        # display state (written by the worker thread)
+        self.latest_frame = None
+        self.latest_out = None
+        self.latest_detection_count = 0
+        self.warmup_count = 0
+
+        self.warmup_start = None
+        self.bench_start = None
+
+    @property
+    def running(self):
+        return self._running
+
+    def _set_phase(self, phase):
+        with self._lock:
+            self.phase = phase
+
+    # =========================================================
+    # START / STOP
     # =========================================================
 
     def start(self):
 
-        if self.running:
-
+        if self._running:
             return
 
-        self.stop_event.clear()
+        self._reset()
+        self._stop_event.clear()
 
-        self.running = True
-
-        self.finished = False
-
-        self.error = None
-
-        self.benchmark_start_time = None
-
-        self.frames_processed = 0
+        self._running = True
+        self.phase = "connecting"
 
         self.thread = threading.Thread(
             target=self._run,
-            daemon=True
+            daemon=True,
+            name="live-benchmark",
         )
 
         self.thread.start()
 
-    # =========================================================
-    # STOP
-    # =========================================================
-
     def stop(self):
 
-        self.stop_event.set()
+        self._stop_event.set()
 
-        if (
-            self.thread is not None
-            and self.thread.is_alive()
-        ):
-
-            self.thread.join(
-                timeout=5
-            )
-
-        self.running = False
+        with self._frame_cv:
+            self._frame_cv.notify_all()
 
     # =========================================================
-    # MODEL TYPE
+    # CAPTURE
     # =========================================================
 
-    def _is_yolo(self):
+    def _open_capture(self):
 
-        return hasattr(
-            self.model,
-            "predict"
-        )
+        src = self.source
+
+        # Camera index
+        if not isinstance(src, str):
+            return cv2.VideoCapture(src)
+
+        is_rtsp = src.lower().startswith(("rtsp://", "rtsps://"))
+
+        env_key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+        previous = os.environ.get(env_key)
+
+        if is_rtsp and self.rtsp_tcp:
+            # UDP drops packets and produces smeared frames; TCP is safer
+            os.environ[env_key] = "rtsp_transport;tcp|fflags;nobuffer"
+
+        try:
+
+            params = [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                8000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                int(self.read_timeout * 1000),
+            ]
+
+            try:
+                return cv2.VideoCapture(src, cv2.CAP_FFMPEG, params)
+            except (TypeError, cv2.error):
+                return cv2.VideoCapture(src)
+
+        finally:
+
+            if previous is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = previous
+
+    def _reader_loop(self, cap):
+        """Keep only the newest frame; never blocks the model."""
+
+        src = self.source
+        is_file = isinstance(src, str) and "://" not in src
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+
+        # A local file would otherwise be read as fast as it decodes;
+        # pace it like a real stream so keep-up numbers make sense.
+        pace = (1.0 / fps) if (is_file and 1.0 < fps < 240.0) else 0.0
+
+        last_ok = time.perf_counter()
+
+        while not self._stop_event.is_set():
+
+            loop_start = time.perf_counter()
+
+            ok, frame = cap.read()
+
+            now = time.perf_counter()
+
+            if ok and frame is not None:
+
+                last_ok = now
+
+                with self._frame_cv:
+                    self._latest = frame
+                    self._frame_id += 1
+                    self._captured += 1
+                    self._frame_cv.notify_all()
+
+                if pace:
+                    remaining = pace - (time.perf_counter() - loop_start)
+
+                    if remaining > 0:
+                        time.sleep(remaining)
+
+            else:
+
+                if now - last_ok > self.read_timeout:
+
+                    with self._frame_cv:
+                        self._stream_lost = True
+                        self._frame_cv.notify_all()
+
+                    return
+
+                time.sleep(0.01)
+
+    def _next_frame(self, last_id):
+        """Wait for a frame newer than `last_id`. Returns (frame, id)."""
+
+        with self._frame_cv:
+
+            deadline = time.perf_counter() + FRAME_WAIT_S
+
+            while (
+                self._frame_id <= last_id
+                and not self._stream_lost
+                and not self._stop_event.is_set()
+            ):
+
+                remaining = deadline - time.perf_counter()
+
+                if remaining <= 0:
+                    break
+
+                self._frame_cv.wait(remaining)
+
+            if self._frame_id > last_id:
+                return self._latest, self._frame_id
+
+            return None, last_id
 
     # =========================================================
-    # YOLO INFERENCE
+    # MODEL CALL (the only timed operation)
     # =========================================================
 
-    def _run_yolo(
-        self,
-        frame
-    ):
+    def _predict(self, frame):
 
-        start = time.perf_counter()
-
-        results = self.model.predict(
-
-            source=frame,
-
-            conf=self.confidence,
-
-            iou=self.iou,
-
-            imgsz=self.imgsz,
-
-            device=self.device,
-
-            verbose=False
-        )
-
-        end = time.perf_counter()
-
-        latency_ms = (
-            end - start
-        ) * 1000.0
-
-        result = results[0]
-
-        # Annotated frame
-        annotated = result.plot()
-
-        # Detection count
-        if result.boxes is not None:
-
-            detections = len(
-                result.boxes
-            )
-
-        else:
-
-            detections = 0
-
-        return (
-            annotated,
-            detections,
-            latency_ms
-        )
-
-    # =========================================================
-    # FASTER R-CNN INFERENCE
-    # =========================================================
-
-    def _run_faster_rcnn(
-        self,
-        frame
-    ):
-
-        start = time.perf_counter()
-
-        # BGR -> RGB
-        rgb = cv2.cvtColor(
+        return infer(
+            self.bundle,
             frame,
-            cv2.COLOR_BGR2RGB
-        )
-
-        # RGB image -> tensor
-        tensor = to_tensor(
-            rgb
-        )
-
-        tensor = tensor.to(
-            self.device
-        )
-
-        # Inference
-        with torch.no_grad():
-
-            outputs = self.model(
-                [tensor]
-            )
-
-        end = time.perf_counter()
-
-        latency_ms = (
-            end - start
-        ) * 1000.0
-
-        output = outputs[0]
-
-        boxes = output["boxes"]
-
-        labels = output["labels"]
-
-        scores = output["scores"]
-
-        # =====================================================
-        # CONFIDENCE FILTER
-        # =====================================================
-
-        keep = (
-            scores
-            >= self.confidence
-        )
-
-        boxes = boxes[keep]
-
-        labels = labels[keep]
-
-        scores = scores[keep]
-
-        detections = len(
-            boxes
-        )
-
-        # =====================================================
-        # DRAW DETECTIONS
-        # =====================================================
-
-        annotated = frame.copy()
-
-        for box, label, score in zip(
-            boxes,
-            labels,
-            scores
-        ):
-
-            coordinates = (
-                box
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(int)
-            )
-
-            x1, y1, x2, y2 = coordinates
-
-            cv2.rectangle(
-                annotated,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2
-            )
-
-            # Faster R-CNN class 1 = coconut
-            class_name = "Coconut"
-
-            text = (
-                f"{class_name} "
-                f"{score.item():.2f}"
-            )
-
-            cv2.putText(
-                annotated,
-                text,
-                (
-                    x1,
-                    max(y1 - 10, 20)
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                2
-            )
-
-        return (
-            annotated,
-            detections,
-            latency_ms
+            self.task,
+            self.confidence,
+            self.iou,
+            self.imgsz,
+            tracking=False,
+            render=False,
         )
 
     # =========================================================
-    # MAIN WORKER
+    # MAIN
     # =========================================================
 
     def _run(self):
 
         cap = None
+        reader = None
+        wall = None
+        end_reason = "completed"
+        stream_stats = None
 
         try:
 
-            # =================================================
-            # OPEN VIDEO SOURCE
-            # =================================================
+            # -------------------------------------------------
+            # CONNECT
+            # -------------------------------------------------
 
-            cap = cv2.VideoCapture(
-                self.source
-            )
+            cap = self._open_capture()
 
             if not cap.isOpened():
-
                 raise RuntimeError(
-                    f"Could not open video source: "
-                    f"{self.source}"
+                    f"Could not open stream:\n{self.source}"
                 )
 
-            # =================================================
-            # WARM-UP
-            # =================================================
-
-            warmup_start = (
-                time.perf_counter()
+            reader = threading.Thread(
+                target=self._reader_loop,
+                args=(cap,),
+                daemon=True,
+                name="live-reader",
             )
 
-            benchmark_started = False
+            reader.start()
 
-            # =================================================
-            # FRAME LOOP
-            # =================================================
+            # -------------------------------------------------
+            # WARM-UP (not counted)
+            # -------------------------------------------------
 
-            while not self.stop_event.is_set():
+            self._set_phase("warmup")
 
-                ret, frame = cap.read()
+            last_id = 0
+            warm_n = 0
 
-                if not ret:
+            self.warmup_start = time.perf_counter()
 
-                    raise RuntimeError(
-                        "Could not read frame "
-                        "from video source."
-                    )
-
-                # =================================================
-                # MODEL INFERENCE
-                # =================================================
-
-                if self._is_yolo():
-
-                    (
-                        annotated,
-                        detections,
-                        latency_ms
-                    ) = self._run_yolo(
-                        frame
-                    )
-
-                else:
-
-                    (
-                        annotated,
-                        detections,
-                        latency_ms
-                    ) = self._run_faster_rcnn(
-                        frame
-                    )
-
-                # =================================================
-                # INFERENCE FPS
-                # =================================================
-
-                if latency_ms > 0:
-
-                    inference_fps = (
-                        1000.0
-                        / latency_ms
-                    )
-
-                else:
-
-                    inference_fps = 0.0
-
-                # =================================================
-                # WARM-UP
-                # =================================================
-
-                now = (
-                    time.perf_counter()
-                )
-
-                warmup_elapsed = (
-                    now
-                    - warmup_start
-                )
+            while not self._stop_event.is_set():
 
                 if (
-                    not benchmark_started
-                    and warmup_elapsed
+                    warm_n >= MIN_WARMUP_INFERENCES
+                    and time.perf_counter() - self.warmup_start
                     >= self.warmup_seconds
                 ):
+                    break
 
-                    benchmark_started = True
+                frame, fid = self._next_frame(last_id)
 
-                    self.benchmark_start_time = (
-                        time.perf_counter()
+                if frame is None:
+
+                    if self._stream_lost:
+                        break
+
+                    continue
+
+                last_id = fid
+
+                self._predict(frame)
+
+                warm_n += 1
+
+                with self._lock:
+                    self.warmup_count = warm_n
+                    self.latest_frame = frame
+
+            if self._stop_event.is_set():
+                end_reason = "stopped_in_warmup"
+
+            elif warm_n == 0:
+                raise RuntimeError(
+                    "No frames were received from the stream "
+                    f"within {self.read_timeout:.0f} s:\n{self.source}"
+                )
+
+            # -------------------------------------------------
+            # BENCHMARK
+            # -------------------------------------------------
+
+            if end_reason == "completed":
+
+                self._set_phase("benchmarking")
+
+                with self._frame_cv:
+                    pending = self._frame_id > last_id
+                    captured_at_start = self._captured - (1 if pending else 0)
+
+                bench_start = time.perf_counter()
+
+                with self._lock:
+                    self.bench_start = bench_start
+
+                while True:
+
+                    if self._stop_event.is_set():
+                        end_reason = "stopped"
+                        break
+
+                    if (
+                        self.benchmark_seconds
+                        and time.perf_counter() - bench_start
+                        >= self.benchmark_seconds
+                    ):
+                        end_reason = "completed"
+                        break
+
+                    frame, fid = self._next_frame(last_id)
+
+                    if frame is None:
+
+                        if self._stream_lost:
+                            end_reason = "stream_ended"
+                            break
+
+                        continue
+
+                    last_id = fid
+
+                    out = self._predict(frame)
+
+                    self.recorder.add(
+                        out["latency_ms"],
+                        out["preprocess_ms"],
+                        out["inference_ms"],
+                        out["postprocess_ms"],
+                        out["count"],
                     )
 
-                    self.frames_processed = 0
+                    with self._lock:
+                        self.latest_frame = frame
+                        self.latest_out = out
+                        self.latest_detection_count = out["count"]
 
-                # =================================================
-                # BENCHMARK
-                # =================================================
+                wall = time.perf_counter() - bench_start
 
-                if benchmark_started:
+                processed = len(self.recorder)
 
-                    self.frames_processed += 1
-
-                    elapsed = (
-                        time.perf_counter()
-                        - self.benchmark_start_time
+                with self._frame_cv:
+                    captured = max(
+                        processed,
+                        self._captured - captured_at_start,
                     )
 
-                    if elapsed > 0:
-
-                        processing_fps = (
-                            self.frames_processed
-                            / elapsed
-                        )
-
-                    else:
-
-                        processing_fps = 0.0
-
-                else:
-
-                    processing_fps = 0.0
-
-                # =================================================
-                # UPDATE STATE
-                # =================================================
-
-                with self.lock:
-
-                    self.frame = annotated
-
-                    self.latency_ms = (
-                        latency_ms
-                    )
-
-                    self.inference_fps = (
-                        inference_fps
-                    )
-
-                    self.processing_fps = (
-                        processing_fps
-                    )
-
-                    self.detections = (
-                        detections
-                    )
+                stream_stats = {
+                    "frames_captured": captured,
+                    "frames_processed": processed,
+                    "frames_skipped": captured - processed,
+                    "keep_up_pct": (
+                        processed / captured * 100.0 if captured else 0.0
+                    ),
+                    "arrival_fps": captured / wall if wall else 0.0,
+                }
 
         except Exception as e:
 
-            with self.lock:
-
-                self.error = str(e)
+            self.error = str(e)
+            end_reason = "error"
 
         finally:
 
-            if cap is not None:
+            # stop the reader, free the capture
+            self._stop_event.set()
 
+            with self._frame_cv:
+                self._frame_cv.notify_all()
+
+            if reader is not None:
+                reader.join(timeout=3)
+
+            if cap is not None:
                 cap.release()
 
-            with self.lock:
+            # ---------------------------------------------
+            # RESULTS (also for partial / stopped runs)
+            # ---------------------------------------------
 
-                self.running = False
+            try:
 
+                self.results = self.recorder.results(
+                    config=self.config,
+                    system=self.system,
+                    end_reason=end_reason,
+                    wall_seconds=wall,
+                    extra=(
+                        {"stream": stream_stats}
+                        if stream_stats
+                        else None
+                    ),
+                )
+
+            except Exception as e:
+
+                if not self.error:
+                    self.error = f"Could not build results: {e}"
+
+            with self._lock:
+                self.phase = "error" if self.error else "finished"
+                self._running = False
                 self.finished = True
 
     # =========================================================
-    # GET STATE
+    # CURRENT STATE (polled by the UI)
     # =========================================================
 
     def get_state(self):
 
-        with self.lock:
+        live = self.recorder.live_stats()
+
+        with self._lock:
+
+            now = time.perf_counter()
+
+            elapsed = 0.0
+
+            if self.bench_start is not None and self._running:
+                elapsed = now - self.bench_start
+
+            warm_elapsed = 0.0
+
+            if self.warmup_start is not None and self.phase == "warmup":
+                warm_elapsed = now - self.warmup_start
+
+            remaining = None
+
+            if self.benchmark_seconds:
+                remaining = max(0.0, self.benchmark_seconds - elapsed)
 
             return {
+                "running": self._running,
+                "finished": self.finished,
+                "error": self.error,
+                "phase": self.phase,
 
-                "frame":
-                    self.frame,
+                "frame": self.latest_frame,
+                "out": self.latest_out,
 
-                "latency_ms":
-                    self.latency_ms,
+                "warmup_count": self.warmup_count,
+                "warmup_elapsed_s": warm_elapsed,
 
-                "inference_fps":
-                    self.inference_fps,
+                "elapsed_s": elapsed,
+                "remaining_s": remaining,
 
-                "processing_fps":
-                    self.processing_fps,
+                "inference_count": live["count"],
+                "last_latency_ms": live["last_ms"],
+                "mean_latency_ms": live["mean_ms"],
+                "mean_fps": live["mean_fps"],
+                "recent_p95_ms": live["recent_p95_ms"],
+                "detection_count": self.latest_detection_count,
 
-                "detections":
-                    self.detections,
+                "recent_latencies": self.recorder.recent_latencies(200),
 
-                "frames_processed":
-                    self.frames_processed,
-
-                "running":
-                    self.running,
-
-                "finished":
-                    self.finished,
-
-                "error":
-                    self.error,
-
-                "benchmark_started":
-                    self.benchmark_start_time
-                    is not None
-            }
-
-    # =========================================================
-    # FINAL BENCHMARK RESULTS
-    # =========================================================
-
-    def get_benchmark_results(self):
-
-        with self.lock:
-
-            if (
-                self.benchmark_start_time
-                is None
-            ):
-
-                return {
-
-                    "benchmark_duration":
-                        0.0,
-
-                    "frames_processed":
-                        0,
-
-                    "average_fps":
-                        0.0
-                }
-
-            duration = (
-                time.perf_counter()
-                - self.benchmark_start_time
-            )
-
-            if duration > 0:
-
-                average_fps = (
-                    self.frames_processed
-                    / duration
-                )
-
-            else:
-
-                average_fps = 0.0
-
-            return {
-
-                "benchmark_duration":
-                    duration,
-
-                "frames_processed":
-                    self.frames_processed,
-
-                "average_fps":
-                    average_fps
+                "results": self.results,
             }

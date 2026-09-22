@@ -37,7 +37,7 @@ Thumbs.db
 dataset/
 data/raw/
 code/
-
+mediamtx
 # Training outputs
 runs/
 checkpoints/
